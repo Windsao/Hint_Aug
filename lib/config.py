@@ -2,7 +2,7 @@ from easydict import EasyDict as edict
 import yaml
 
 cfg = edict()
-
+t_cfg = edict()
 
 def _edict2dict(dest_dict, src_edict):
     if isinstance(dest_dict, dict) and isinstance(src_edict, dict):

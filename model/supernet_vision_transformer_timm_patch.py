@@ -204,7 +204,7 @@ default_cfgs = {
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,LoRA_dim=1024, prefix_dim=1024, drop_rate_LoRA=0):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,LoRA_dim=1024, prefix_dim=1024, drop_rate_LoRA=0, teacher=False):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -226,7 +226,8 @@ class Attention(nn.Module):
             nn.init.kaiming_uniform_(self.LoRA_a.weight, a=math.sqrt(5))
             self.LoRA_b = nn.Linear(LoRA_dim, dim*3,bias = False)
             nn.init.zeros_(self.LoRA_b.weight)
-
+        
+        self.teacher = teacher
 
         # prefix setting
         print('prefix_dim',prefix_dim)
@@ -274,16 +275,18 @@ class Attention(nn.Module):
 
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-        if self.LoRA_identity == False:
-            qkv_delta = F.linear(self.LoRA_drop(x), self.LoRA_a_weight)
-            qkv_delta = F.linear(qkv_delta, self.LoRA_b_weight).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-            q_delta, k_delta, v_delta = qkv_delta.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-            q,k,v = q+q_delta,k+k_delta,v+v_delta
 
-        if self.prefix_identity == False:
-            prefix_weight_key = self.prefix_weight_key.expand(B,-1,-1)
-            prefix_weight_value = self.prefix_weight_value.expand(B,-1,-1)
-            k,v = torch.cat((k,prefix_weight_key), dim=1), torch.cat((v,prefix_weight_value), dim=1)
+        if not self.teacher:
+            if self.LoRA_identity == False:
+                qkv_delta = F.linear(self.LoRA_drop(x), self.LoRA_a_weight)
+                qkv_delta = F.linear(qkv_delta, self.LoRA_b_weight).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+                q_delta, k_delta, v_delta = qkv_delta.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+                q,k,v = q+q_delta,k+k_delta,v+v_delta
+
+            if self.prefix_identity == False:
+                prefix_weight_key = self.prefix_weight_key.expand(B,-1,-1)
+                prefix_weight_value = self.prefix_weight_value.expand(B,-1,-1)
+                k,v = torch.cat((k,prefix_weight_key), dim=1), torch.cat((v,prefix_weight_value), dim=1)
 
         
 
@@ -300,10 +303,10 @@ class Attention(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,visual_prompt_dim=1024,LoRA_dim=1024,adapter_dim=1024,prefix_dim=1024,drop_rate_LoRA=0,drop_rate_prompt=0,drop_rate_adapter=0):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,visual_prompt_dim=1024,LoRA_dim=1024,adapter_dim=1024,prefix_dim=1024,drop_rate_LoRA=0,drop_rate_prompt=0,drop_rate_adapter=0, teacher=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,LoRA_dim=LoRA_dim,prefix_dim=prefix_dim,drop_rate_LoRA=drop_rate_LoRA)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,LoRA_dim=LoRA_dim,prefix_dim=prefix_dim,drop_rate_LoRA=drop_rate_LoRA, teacher=teacher)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -326,7 +329,7 @@ class Block(nn.Module):
                 drop_rate_adapter=drop_rate_adapter
                     )
 
-
+        self.teacher = teacher
 
 
     def set_sample_config(self, sample_LoRA_dim=None,sample_adapter_dim=None,sample_prefix_dim=None,sample_last_prompt_tuning_dim=None,sample_prompt_tuning_dim=None):
@@ -354,18 +357,23 @@ class Block(nn.Module):
     def forward(self, x): 
         x, attn_list = x
         B = x.shape[0]
-        if self.sample_visual_prompt_dim != 0:
-            visual_prompt_tokens = self.visual_prompt_token[:,:self.sample_visual_prompt_dim,:].expand(B,-1,-1)
+        if not self.teacher:
+            if self.sample_visual_prompt_dim != 0:
+                visual_prompt_tokens = self.visual_prompt_token[:,:self.sample_visual_prompt_dim,:].expand(B,-1,-1)
 
-            visual_prompt_tokens = self.drop_prompt(visual_prompt_tokens)
-            if self.sample_last_prompt_tuning_dim == 0:
-                x = torch.cat((x,visual_prompt_tokens), dim=1)
-            else:
-                x = torch.cat((x[:,:-self.sample_last_prompt_tuning_dim,:],visual_prompt_tokens), dim=1)
+                visual_prompt_tokens = self.drop_prompt(visual_prompt_tokens)
+                if self.sample_last_prompt_tuning_dim == 0:
+                    x = torch.cat((x,visual_prompt_tokens), dim=1)
+                else:
+                    x = torch.cat((x[:,:-self.sample_last_prompt_tuning_dim,:],visual_prompt_tokens), dim=1)
+
         attn_temp, attn = self.attn(self.norm1(x))
         attn_list.append(attn.clone())
         x = x + self.drop_path(attn_temp)
-        x = x + self.adapter(self.drop_path(self.mlp(self.norm2(x))))
+        if not self.teacher:
+            x = x + self.adapter(self.drop_path(self.mlp(self.norm2(x))))
+        else:
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
         return [x, attn_list]
 
 
@@ -382,7 +390,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None, 
-                 act_layer=None, weight_init='',super_prompt_tuning_dim=1024,super_LoRA_dim=1024,super_adapter_dim=1024,super_prefix_dim=1024,drop_rate_LoRA=0,drop_rate_prompt=0,drop_rate_adapter=0, IS_not_position_VPT=False, patch_fool=False):
+                 act_layer=None, weight_init='',super_prompt_tuning_dim=1024,super_LoRA_dim=1024,super_adapter_dim=1024,super_prefix_dim=1024,drop_rate_LoRA=0,drop_rate_prompt=0,drop_rate_adapter=0, IS_not_position_VPT=False, patch_fool=False, teacher=False):
         """
         Args:
             img_size (int, tuple): input image size
@@ -426,7 +434,7 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.Sequential(*[
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
-                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,visual_prompt_dim=super_prompt_tuning_dim,LoRA_dim=super_LoRA_dim,adapter_dim=super_adapter_dim,prefix_dim=super_prefix_dim,drop_rate_LoRA=drop_rate_LoRA,drop_rate_prompt=drop_rate_prompt,drop_rate_adapter=drop_rate_adapter)
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,visual_prompt_dim=super_prompt_tuning_dim,LoRA_dim=super_LoRA_dim,adapter_dim=super_adapter_dim,prefix_dim=super_prefix_dim,drop_rate_LoRA=drop_rate_LoRA,drop_rate_prompt=drop_rate_prompt,drop_rate_adapter=drop_rate_adapter, teacher=teacher)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -463,6 +471,7 @@ class VisionTransformer(nn.Module):
         self.super_prefix_dim = super_prefix_dim
 
         self.patch_fool = patch_fool
+        self.teacher = teacher
 
         self.init_weights(weight_init)
 
@@ -634,13 +643,13 @@ class VisionTransformer(nn.Module):
         else:
             x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
-        
-        if self.sample_prompt_tuning_dim[0] != 0:
-            visual_prompt_tokens = self.visual_prompt_token[:,:self.sample_prompt_tuning_dim[0],:].expand(B,-1,-1)
-            if not self.IS_not_position_VPT:
-                visual_prompt_tokens = visual_prompt_tokens + self.visual_prompt_token_pos_embed[:,:self.sample_prompt_tuning_dim[0],:]
-            visual_prompt_tokens = self.drop_prompt(visual_prompt_tokens)
-            x = torch.cat((x,visual_prompt_tokens), dim=1)
+        if not self.teacher:
+            if self.sample_prompt_tuning_dim[0] != 0:
+                visual_prompt_tokens = self.visual_prompt_token[:,:self.sample_prompt_tuning_dim[0],:].expand(B,-1,-1)
+                if not self.IS_not_position_VPT:
+                    visual_prompt_tokens = visual_prompt_tokens + self.visual_prompt_token_pos_embed[:,:self.sample_prompt_tuning_dim[0],:]
+                visual_prompt_tokens = self.drop_prompt(visual_prompt_tokens)
+                x = torch.cat((x,visual_prompt_tokens), dim=1)
  
         x = [x, []]
         x = self.blocks(x)
@@ -855,7 +864,6 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
     default_cfg = default_cfg or default_cfgs[variant]
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
-
     # NOTE this extra code to support handling of repr size for in21k pretrained models
     default_num_classes = default_cfg['num_classes']
     num_classes = kwargs.get('num_classes', default_num_classes)

@@ -3,7 +3,7 @@
 
 currenttime=`date "+%Y%m%d_%H%M%S"`
 
-CONFIG=/home/sw99/NOAH/experiments/Adapter/ViT-B_prompt_adapter_8_patch.yaml
+CONFIG=/home/sw99/Hint_Aug/experiments/Adapter/ViT-B_prompt_adapter_8_patch.yaml
 CKPT=/home/sw99/ViT-B_16.npz
 WEIGHT_DECAY=0.0001
 

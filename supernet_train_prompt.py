@@ -229,9 +229,8 @@ def main(args):
         args.distributed = False
     else:
         args.distributed = True
-        init_dist(launcher=args.launcher)
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
+        utils.init_distributed_mode(args)
+        print(args.gpu, args.rank)
 
     print(args)
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -333,7 +332,6 @@ def main(args):
             load_checkpoint(model, args.resume)
             if args.nb_classes != model.head.weight.shape[0]:
                 model.reset_classifier(args.nb_classes)
-
     model.to(device)
     if args.teacher_model:
         teacher_model = create_model(
