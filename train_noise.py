@@ -6,6 +6,8 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import yaml
+import copy
+
 from pathlib import Path
 from timm.data import Mixup
 from timm.models import create_model
@@ -14,12 +16,11 @@ from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler
 from lib.datasets import build_dataset
-from engine_noise import train_one_epoch, evaluate
+from engine_noise import train_one_epoch, evaluate, train_one_epoch_delta, evaluate_delta
 from lib.samplers import RASampler
 from lib import utils
 from lib.config import cfg, update_config_from_file
 from model.supernet_vision_transformer_timm_patch import VisionTransformer
-
 
 import model as models
 from timm.models import load_checkpoint
@@ -243,9 +244,15 @@ def get_args_parser():
     parser.add_argument('--transmix', action='store_true')
     parser.add_argument('--start_adv', default=100, type=int)
     
-
-
+    parser.add_argument('--fixed_noise',action='store_true')
+    parser.add_argument('--train_twice',action='store_true')
+    parser.add_argument('--pretrained_noise',action='store_true')
+    
     return parser
+
+
+def clamp(X, lower_limit, upper_limit):
+    return torch.max(torch.min(X, upper_limit), lower_limit)
 
 def main(args):
 
@@ -372,18 +379,16 @@ def main(args):
         )
         teacher_model.to(device)
         teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        teacher_model.eval()
     else:
         teacher_model = None
-        teacher_loss = None
-    teacher_model.eval()
+        teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     model_ema = None
 
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
-
-
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -426,37 +431,94 @@ def main(args):
     print("Start training")
     start_time = time.time()
     max_accuracy = 0.0
+    if args.fixed_noise:
+        Lp = 8/255.
+        eps = torch.tensor([Lp, Lp, Lp]).view(3, 1, 1).cuda()
+        delta = torch.randn((1, 3, args.input_size, args.input_size)).cuda()
+        delta.data = clamp(delta, -eps, eps)
+        delta.requires_grad = True
+    if args.pretrained_noise:
+        print('Start pretrained on noise!')
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                data_loader_train.sampler.set_epoch(epoch)
+            train_stats, train_pred, train_true, train_out = train_one_epoch_delta(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=delta
+            )
+            save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
+            lr_scheduler.step(epoch)
+
+            if epoch > args.epochs * 0.6 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
+                test_stats, y_pred, y_true, y_out = evaluate_delta(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=delta)
+
+                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                max_accuracy = max(max_accuracy, test_stats["acc1"])
+                print(f'Max accuracy: {max_accuracy:.2f}%')
+                
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                            **{f'test_{k}': v for k, v in test_stats.items()},
+                            'epoch': epoch,
+                            'n_parameters': n_parameters}
+
+                if args.output_dir and utils.is_main_process():
+                    with (output_dir / "log.txt").open("a") as f:
+                        f.write(json.dumps(log_stats) + "\n")
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('Finish pretrained on noise! Training time {}'.format(total_time_str))
+        teacher_model = copy.deepcopy(model)
+        teacher_model.eval()
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-
-        train_stats, train_pred, train_true, train_out = train_one_epoch(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, model_ema, mixup_fn,
-            amp=args.amp, teacher_model=teacher_model,
-            teach_loss=teacher_loss,
-            choices=choices, mode = args.mode, retrain_config=retrain_config,
-            is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
-            args=args
-        )
+        if args.train_twice:
+             train_stats, train_pred, train_true, train_out = train_one_epoch_delta(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=delta
+            )
+        if args.pretrained_noise:
+            train_stats, train_pred, train_true, train_out = train_one_epoch(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=delta 
+            )
+        else:
+            train_stats, train_pred, train_true, train_out = train_one_epoch(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=None 
+            )
 
         save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
-        '''
-        if args.is_visual_prompt_tuning:
-            np.save('./VPT_adv/train_' + save_name + '_y_pred.npy', train_pred)
-            np.save('./VPT_adv/train_' + save_name + '_y_true.npy', train_true)
-            np.save('./VPT_adv/train_' + save_name + '_y_out.npy', train_out)
-        elif args.is_adapter:
-            np.save('./Adap_adv/train_' + save_name + '_y_pred.npy', train_pred)
-            np.save('./Adap_adv/train_' + save_name + '_y_true.npy', train_true)
-            np.save('./Adap_adv/train_' + save_name + '_y_out.npy', train_out)
-        elif args.is_LoRA:
-            np.save('./LoRA_adv/train_' + save_name + '_y_pred.npy', train_pred)
-            np.save('./LoRA_adv/train_' + save_name + '_y_true.npy', train_true)
-            np.save('./LoRA_adv/train_' + save_name + '_y_out.npy', train_out)
-        '''
         lr_scheduler.step(epoch)
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -470,25 +532,15 @@ def main(args):
                     'args': args, 
                 }, checkpoint_path)
 
-        if epoch > args.epochs * 0.4 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
-            test_stats, y_pred, y_true, y_out = evaluate(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args)
+        if epoch > args.epochs * 0.6 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
+            test_stats, y_pred, y_true, y_out = evaluate(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=None)
+            if args.train_twice:
+                test_noise_stats, y_pred, y_true, y_out = evaluate_delta(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=delta)
+            
+            if args.pretrained_noise:
+                test_noise_stats, y_pred, y_true, y_out = evaluate_delta(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=delta)
+
             print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-            '''
-            if max_accuracy < test_stats["acc1"]:
-                save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
-                if args.is_visual_prompt_tuning:
-                    np.save('./VPT_adv/' + save_name + '_y_pred.npy', train_pred)
-                    np.save('./VPT_adv/' + save_name + '_y_true.npy', train_true)
-                    np.save('./VPT_adv/' + save_name + '_y_out.npy', train_out)
-                elif args.is_adapter:
-                    np.save('./Adap_adv/' + save_name + '_y_pred.npy', train_pred)
-                    np.save('./Adap_adv/' + save_name + '_y_true.npy', train_true)
-                    np.save('./Adap_adv/' + save_name + '_y_out.npy', train_out)
-                elif args.is_LoRA:
-                    np.save('./LoRA_adv/' + save_name + '_y_pred.npy', train_pred)
-                    np.save('./LoRA_adv/' + save_name + '_y_true.npy', train_true)
-                    np.save('./LoRA_adv/' + save_name + '_y_out.npy', train_out)
-            '''
             max_accuracy = max(max_accuracy, test_stats["acc1"])
             print(f'Max accuracy: {max_accuracy:.2f}%')
             
