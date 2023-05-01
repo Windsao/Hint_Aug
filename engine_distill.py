@@ -74,7 +74,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # set random seed
     random.seed(epoch)
     
-    kl_loss = nn.KLDivLoss(reduction="batchmean")
+    # kl_loss = nn.KLDivLoss(reduction="batchmean")
     alpha = 0.8
 
     y_out = []
@@ -141,7 +141,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                                 mask = torch.zeros_like(samples).cuda()
                                 mask[..., 0:16, 0:16] = 1
                             patch = delta * mask
-
+                        else:
+                            patch = torch.zeros_like(samples)
                         teach_output, t_attn = teacher_model(samples + patch)
                     else:
                         teach_output = teacher_model(samples)
@@ -159,7 +160,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             
             loss_value = loss.item() + alpha * attn_loss
             
-            loss += alpha * attn_loss
+            loss -= alpha * attn_loss
         else:
             loss_value = loss.item()
 

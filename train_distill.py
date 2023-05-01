@@ -6,6 +6,8 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import yaml
+import copy
+
 from pathlib import Path
 from timm.data import Mixup
 from timm.models import create_model
@@ -14,13 +16,12 @@ from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler
 from lib.datasets import build_dataset
-from engine_test import train_one_epoch, evaluate
+from engine_distill import train_one_epoch, evaluate, train_one_epoch_delta, evaluate_delta
 from lib.samplers import RASampler
 from lib import utils
 from lib.config import cfg, update_config_from_file
-from model.supernet_vision_transformer_timm import VisionTransformer
-import torch.distributed as dist
-import copy
+from model.supernet_vision_transformer_timm_patch import VisionTransformer
+
 import model as models
 from timm.models import load_checkpoint
 
@@ -28,7 +29,7 @@ from timm.models import load_checkpoint
 from mmcv.runner import get_dist_info, init_dist
 
 import os
-import utils
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('AutoFormer training and evaluation script', add_help=False)
@@ -36,6 +37,7 @@ def get_args_parser():
     parser.add_argument('--epochs', default=300, type=int)
     # config file
     parser.add_argument('--cfg',help='experiment configure file name',required=True,type=str)
+    parser.add_argument('--t_cfg',help='experiment configure file name',type=str)
 
     # custom parameters
     parser.add_argument('--platform', default='pai', type=str, choices=['itp', 'pai', 'aml'],
@@ -51,7 +53,7 @@ def get_args_parser():
     parser.add_argument('--model', default='', type=str, metavar='MODEL',
                         help='Name of model to train')
     # AutoFormer config
-    parser.add_argument('--mode', type=str, default='super', choices=['super', 'vp','retrain','search', 'baseline'], help='mode of AutoFormer')
+    parser.add_argument('--mode', type=str, default='super', choices=['super', 'vp','retrain','search'], help='mode of AutoFormer')
     parser.add_argument('--input-size', default=224, type=int)
     parser.add_argument('--patch_size', default=16, type=int)
 
@@ -126,7 +128,7 @@ def get_args_parser():
 
     parser.add_argument('--repeated-aug', action='store_true')
     # parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
-    parser.add_argument('--save_output', action='store_true')
+
 
     # parser.set_defaults(repeated_aug=True)
 
@@ -216,29 +218,54 @@ def get_args_parser():
     parser.add_argument('--direct_resize',action='store_true')
 
     parser.add_argument('--IS_not_position_VPT',action='store_true')
-    
-    parser.add_argument('--eps', default=0.01, type=float)
-    parser.add_argument('--atk_type', default='untargeted', type=str)
 
+    # Patch-fool params
+    parser.add_argument('--patch_fool',action='store_true')
+    parser.add_argument('--patch_select', default='Attn', type=str, choices=['Rand', 'Saliency', 'Attn'])
+    parser.add_argument('--num_patch', default=2, type=int)
+    parser.add_argument('--sparse_pixel_num', default=0, type=int)
+
+    parser.add_argument('--attack_mode', default='CE_loss', choices=['CE_loss', 'Attention'], type=str)
+    parser.add_argument('--atten_loss_weight', default=0.002, type=float)
+    parser.add_argument('--atten_select', default=4, type=int, help='Select patch based on which attention layer')
+    parser.add_argument('--mild_l_2', default=0., type=float, help='Range: 0-16')
+    parser.add_argument('--mild_l_inf', default=0., type=float, help='Range: 0-1')
+
+    parser.add_argument('--train_attack_iters', default=1, type=int)
+    parser.add_argument('--random_sparse_pixel', action='store_true', help='random select sparse pixel or not')
+    parser.add_argument('--learnable_mask_stop', default=200, type=int)
+
+    parser.add_argument('--attack_learning_rate', default=0.1, type=float)
+    parser.add_argument('--step_size', default=5, type=int)
+    parser.add_argument('--gamma', default=0.95, type=float)
+
+    parser.add_argument('--use_cf_mat',action='store_true')
+    parser.add_argument('--use_pre_soft',action='store_true')
+    parser.add_argument('--transmix', action='store_true')
+    parser.add_argument('--start_adv', default=100, type=int)
+    
+    parser.add_argument('--fixed_noise',action='store_true')
+    parser.add_argument('--train_twice',action='store_true')
+    parser.add_argument('--pretrained_noise',action='store_true')
+    
     return parser
+
+
+def clamp(X, lower_limit, upper_limit):
+    return torch.max(torch.min(X, upper_limit), lower_limit)
 
 def main(args):
 
     # utils.init_distributed_mode(args)
     update_config_from_file(args.cfg)
+    if args.t_cfg is not None:
+        update_teacher_config_from_file(args.t_cfg)
     if args.launcher == 'none':
         args.distributed = False
     else:
         args.distributed = True
         utils.init_distributed_mode(args)
         print(args.gpu, args.rank)
-        # exit()
-        # exit()
-        # init_dist(launcher=args.launcher)
-        # # args.rank = int(os.environ['SLURM_PROCID'])
-        # args.rank = get_rank()
-        # args.gpu = args.rank % torch.cuda.device_count()
-
 
     print(args)
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -288,7 +315,7 @@ def main(args):
     )
 
     data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, batch_size=int(4 * args.batch_size),
+        dataset_val, batch_size=int(2 * args.batch_size),
         sampler=sampler_val, num_workers=args.num_workers,
         pin_memory=args.pin_mem, drop_last=False
     )
@@ -312,7 +339,8 @@ def main(args):
                                                 drop_path_rate=args.drop_path,
                                                 super_prompt_tuning_dim=cfg.SUPERNET.VISUAL_PROMPT_DIM,super_LoRA_dim=cfg.SUPERNET.LORA_DIM,super_adapter_dim=cfg.SUPERNET.ADAPTER_DIM,super_prefix_dim=cfg.SUPERNET.PREFIX_DIM,
                                                 drop_rate_LoRA=args.drop_rate_LoRA,drop_rate_prompt=args.drop_rate_prompt,drop_rate_adapter=args.drop_rate_adapter,
-                                                IS_not_position_VPT = args.IS_not_position_VPT
+                                                IS_not_position_VPT = args.IS_not_position_VPT,
+                                                patch_fool=args.patch_fool
                                                 )
 
     choices = {'depth': cfg.SUPERNET.DEPTH,
@@ -340,41 +368,27 @@ def main(args):
             load_checkpoint(model, args.resume)
             if args.nb_classes != model.head.weight.shape[0]:
                 model.reset_classifier(args.nb_classes)
-
-    gen_model = models.__dict__[cfg.MODEL_NAME](   
-                                                img_size=args.input_size,
-                                                drop_rate=args.drop,
-                                                drop_path_rate=args.drop_path,
-                                                super_prompt_tuning_dim=cfg.SUPERNET.VISUAL_PROMPT_DIM,super_LoRA_dim=cfg.SUPERNET.LORA_DIM,super_adapter_dim=cfg.SUPERNET.ADAPTER_DIM,super_prefix_dim=cfg.SUPERNET.PREFIX_DIM,
-                                                drop_rate_LoRA=args.drop_rate_LoRA,drop_rate_prompt=args.drop_rate_prompt,drop_rate_adapter=args.drop_rate_adapter,
-                                                IS_not_position_VPT = args.IS_not_position_VPT
-                                                )
-    gen_model.to(device)
-    
     model.to(device)
     if args.teacher_model:
         teacher_model = create_model(
             args.teacher_model,
             pretrained=True,
             num_classes=args.nb_classes,
+            patch_fool=args.patch_fool,
+            teacher=True
         )
         teacher_model.to(device)
         teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        teacher_model.eval()
     else:
         teacher_model = None
-        teacher_loss = None
-
-
+        teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     model_ema = None
 
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
-        gen_model = torch.nn.parallel.DistributedDataParallel(gen_model, device_ids=[args.gpu], find_unused_parameters=True)
-        gen_model_without_ddp = gen_model.module
-
-
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -410,43 +424,104 @@ def main(args):
         retrain_config = {'visual_prompt_dim':cfg.RETRAIN.VISUAL_PROMPT_DIM,'lora_dim':cfg.RETRAIN.LORA_DIM,'adapter_dim':cfg.RETRAIN.ADAPTER_DIM,'prefix_dim':prefix_dim}
 
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device,  mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix)
+        test_stats = evaluate(data_loader_val, model, device,  mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
     print("Start training")
     start_time = time.time()
     max_accuracy = 0.0
+    if args.fixed_noise:
+        Lp = 8/255.
+        eps = torch.tensor([Lp, Lp, Lp]).view(3, 1, 1).cuda()
+        delta = torch.randn((1, 3, args.input_size, args.input_size)).cuda()
+        delta.data = clamp(delta, -eps, eps)
+        delta.requires_grad = True
+    else:
+        delta = None
+
+    if args.pretrained_noise:
+        print('Start pretrained on noise!')
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                data_loader_train.sampler.set_epoch(epoch)
+            train_stats, train_pred, train_true, train_out = train_one_epoch_delta(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=delta
+            )
+            save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
+            lr_scheduler.step(epoch)
+
+            if epoch > args.epochs * 0.6 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
+                test_stats, y_pred, y_true, y_out = evaluate_delta(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=delta)
+
+                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                max_accuracy = max(max_accuracy, test_stats["acc1"])
+                print(f'Max accuracy: {max_accuracy:.2f}%')
+                
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                            **{f'test_{k}': v for k, v in test_stats.items()},
+                            'epoch': epoch,
+                            'n_parameters': n_parameters}
+
+                if args.output_dir and utils.is_main_process():
+                    with (output_dir / "log.txt").open("a") as f:
+                        f.write(json.dumps(log_stats) + "\n")
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('Finish pretrained on noise! Training time {}'.format(total_time_str))
+        teacher_model = copy.deepcopy(model)
+        teacher_model.eval()
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-
-        train_stats, train_pred, train_true, train_out = train_one_epoch(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, model_ema, mixup_fn,
-            amp=args.amp, teacher_model=teacher_model,
-            teach_loss=teacher_loss,
-            choices=choices, mode = args.mode, retrain_config=retrain_config,
-            is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, classes=args.nb_classes, gen_model=gen_model, eps=args.eps, atk_type=args.atk_type
-        )
+        if args.train_twice:
+             train_stats, train_pred, train_true, train_out = train_one_epoch_delta(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=delta
+            )
+        if args.pretrained_noise:
+            train_stats, train_pred, train_true, train_out = train_one_epoch(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=delta 
+            )
+        else:
+            train_stats, train_pred, train_true, train_out = train_one_epoch(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, teacher_model=teacher_model,
+                teach_loss=teacher_loss,
+                choices=choices, mode = args.mode, retrain_config=retrain_config,
+                is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix,
+                args=args,
+                delta=None 
+            )
 
         save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
-        if args.save_output:
-            if args.is_visual_prompt_tuning:
-                np.save('./VPT_adv/train_' + save_name + '_y_pred.npy', train_pred)
-                np.save('./VPT_adv/train_' + save_name + '_y_true.npy', train_true)
-                np.save('./VPT_adv/train_' + save_name + '_y_out.npy', train_out)
-            elif args.is_adapter:
-                np.save('./Adap_adv/train_' + save_name + '_y_pred.npy', train_pred)
-                np.save('./Adap_adv/train_' + save_name + '_y_true.npy', train_true)
-                np.save('./Adap_adv/train_' + save_name + '_y_out.npy', train_out)
-            elif args.is_LoRA:
-                np.save('./LoRA_adv/train_' + save_name + '_y_pred.npy', train_pred)
-                np.save('./LoRA_adv/train_' + save_name + '_y_true.npy', train_true)
-                np.save('./LoRA_adv/train_' + save_name + '_y_out.npy', train_out)
-
         lr_scheduler.step(epoch)
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -460,25 +535,15 @@ def main(args):
                     'args': args, 
                 }, checkpoint_path)
 
-        if epoch > args.epochs * 0.4 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
-            test_stats, y_pred, y_true, y_out = evaluate(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix)
-            print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-            if max_accuracy < test_stats["acc1"]:
-                save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
-                if args.save_output:
-                    if args.is_visual_prompt_tuning:
-                        np.save('./VPT_adv/' + save_name + '_y_pred.npy', train_pred)
-                        np.save('./VPT_adv/' + save_name + '_y_true.npy', train_true)
-                        np.save('./VPT_adv/' + save_name + '_y_out.npy', train_out)
-                    elif args.is_adapter:
-                        np.save('./Adap_adv/' + save_name + '_y_pred.npy', train_pred)
-                        np.save('./Adap_adv/' + save_name + '_y_true.npy', train_true)
-                        np.save('./Adap_adv/' + save_name + '_y_out.npy', train_out)
-                    elif args.is_LoRA:
-                        np.save('./LoRA_adv/' + save_name + '_y_pred.npy', train_pred)
-                        np.save('./LoRA_adv/' + save_name + '_y_true.npy', train_true)
-                        np.save('./LoRA_adv/' + save_name + '_y_out.npy', train_out)
+        if epoch > args.epochs * 0.6 and epoch % args.val_interval == 0 or epoch == args.epochs-1:
+            test_stats, y_pred, y_true, y_out = evaluate(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=None)
+            if args.train_twice:
+                test_noise_stats, y_pred, y_true, y_out = evaluate_delta(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=delta)
+            
+            if args.pretrained_noise:
+                test_noise_stats, y_pred, y_true, y_out = evaluate_delta(data_loader_val, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config,is_visual_prompt_tuning=args.is_visual_prompt_tuning,is_adapter=args.is_adapter,is_LoRA=args.is_LoRA,is_prefix=args.is_prefix, args=args, delta=delta)
 
+            print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             max_accuracy = max(max_accuracy, test_stats["acc1"])
             print(f'Max accuracy: {max_accuracy:.2f}%')
             

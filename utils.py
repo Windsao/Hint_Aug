@@ -66,6 +66,56 @@ def PCGrad(atten_grad, ce_grad, sim, shape):
     atten_grad = atten_grad.view(shape)
     return atten_grad
 
+def get_attn_mask(model, X, y, args):
+    patch_size = 16    
+    filter = torch.ones([1, 3, patch_size, patch_size]).float().cuda()
+
+    patch_num_per_line = int(X.size(-1) / patch_size)
+    delta = torch.zeros_like(X).cuda()
+    delta.requires_grad = True
+
+    model.zero_grad()
+    out, atten = model(X)
+    
+    '''choose patch'''
+    # max_patch_index size: [Batch, num_patch attack]
+    if args.patch_select == 'Rand':
+        '''random choose patch'''
+        max_patch_index = np.random.randint(0, 14 * 14, (X.size(0), args.num_patch))
+        max_patch_index = torch.from_numpy(max_patch_index)
+    elif args.patch_select == 'Saliency':
+        '''gradient based method'''
+        grad = torch.autograd.grad(loss, delta)[0]
+        # print(grad.shape)
+        grad = torch.abs(grad)
+        patch_grad = F.conv2d(grad, filter, stride=patch_size)
+        patch_grad = patch_grad.view(patch_grad.size(0), -1)
+        max_patch_index = patch_grad.argsort(descending=True)[:, :args.num_patch]
+    elif args.patch_select == 'Attn':
+        '''attention based method'''
+        atten_layer = atten[args.atten_select].mean(dim=1)
+        atten_layer = atten_layer.mean(dim=-2)[:, 1:]
+        max_patch_index = atten_layer.argsort(descending=True)[:, :args.num_patch]
+    else:
+        print(f'Unknown patch_select: {args.patch_select}')
+        raise
+    '''build mask'''
+    mask = torch.zeros([X.size(0), 1, X.size(2), X.size(3)]).cuda()
+    if args.sparse_pixel_num != 0:
+        learnable_mask = mask.clone()
+
+    for j in range(X.size(0)):
+        index_list = max_patch_index[j]
+        for index in index_list:
+            row = (index // patch_num_per_line) * patch_size
+            column = (index % patch_num_per_line) * patch_size
+
+            if args.sparse_pixel_num != 0:
+                learnable_mask.data[j, :, row:row + patch_size, column:column + patch_size] = torch.rand(
+                    [patch_size, patch_size])
+            mask[j, :, row:row + patch_size, column:column + patch_size] = 1
+    return mask
+
 def patch_fool_mask(model, X, y, args):
     patch_size = 16    
     filter = torch.ones([1, 3, patch_size, patch_size]).float().cuda()
