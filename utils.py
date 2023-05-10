@@ -236,6 +236,7 @@ def patch_fool_mask(model, X, y, args):
 
         criterion = nn.CrossEntropyLoss().cuda()
         '''final CE-loss'''
+
         loss = criterion(out, y)
 
         if args.attack_mode == 'Attention':
@@ -351,6 +352,8 @@ def patch_fool(model, X, y, args):
         atten_layer = atten[args.atten_select].mean(dim=1)
         atten_layer = atten_layer.mean(dim=-2)[:, 1:]
         max_patch_index = atten_layer.argsort(descending=True)[:, :args.num_patch]
+    elif args.patch_select == 'Fixed':
+        max_patch_index = torch.zeros((X.size(0), args.num_patch))
     else:
         print(f'Unknown patch_select: {args.patch_select}')
         raise
@@ -362,6 +365,8 @@ def patch_fool(model, X, y, args):
     for j in range(X.size(0)):
         index_list = max_patch_index[j]
         for index in index_list:
+            if args.patch_select == 'Fixed':
+                index = 0
             row = (index // patch_num_per_line) * patch_size
             column = (index % patch_num_per_line) * patch_size
 
@@ -438,8 +443,11 @@ def patch_fool(model, X, y, args):
             out, atten = model(X + torch.mul(delta, mask))
 
         criterion = nn.CrossEntropyLoss().cuda()
+        
         '''final CE-loss'''
-        loss = criterion(out, y)
+        target_y = torch.zeros_like(y).cuda()
+        loss = criterion(out, target_y)
+        # loss = criterion(out, y)
 
         if args.attack_mode == 'Attention':
             grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]

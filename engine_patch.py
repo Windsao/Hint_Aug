@@ -104,7 +104,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         real_label = targets.clone()
         if args.switch_bn:
             myutils.change_bn(model, 0)
-
         # freeze_norm(model)
         # sample random config
         if mode == 'baseline':

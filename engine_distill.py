@@ -76,7 +76,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     
     # kl_loss = nn.KLDivLoss(reduction="batchmean")
     alpha = 0.8
-
+    
     y_out = []
     y_pred = []
     y_true = []
@@ -155,7 +155,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             attn_loss = 0.0
             for i in range(len(attn)):
                 # attn_loss += kl_loss(attn[i], t_attn[i])
-                attn_loss += torch.cdist(attn[i], t_attn[i], p=2).mean()
+                # attn_loss += torch.cdist(attn[i], t_attn[i], p=2).mean()
+                atten_layer = attn[i].mean(dim=1)
+                print(atten_layer.shape)
+                atten_layer = atten_layer.mean(dim=-2)[:, 1]
+                print(atten_layer.shape)
+                exit()
             metric_logger.update(attn_loss=attn_loss)
             
             loss_value = loss.item() + alpha * attn_loss
