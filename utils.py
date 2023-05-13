@@ -590,23 +590,25 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
     max_patch_index_matrix = max_patch_index[:, 0]
     max_patch_index_matrix = max_patch_index_matrix.repeat(197, 1)
     max_patch_index_matrix = max_patch_index_matrix.permute(1, 0)
-    max_patch_index_matrix = max_patch_index_matrix.flatten().long()
+    max_patch_index_matrix = max_patch_index_matrix.flatten().long().cuda()
 
-    if args.mild_l_inf == 0:
-        if delta is None:
-            '''random init delta'''
-            delta = (torch.rand_like(X) - mu) / std
-        else:
-            delta = (delta - mu) / std
-    else:
-        '''constrain delta: range [x-epsilon, x+epsilon]'''
-        epsilon = args.mild_l_inf / std
-        if delta is None:
-            delta = 2 * epsilon * torch.rand_like(X) - epsilon + X
-        else:
-            delta = 2 * epsilon * delta - epsilon + delta
-
+    # if args.mild_l_inf == 0:
+    #     if delta is None:
+    #         '''random init delta'''
+    #         delta = (torch.rand_like(X) - mu) / std
+    #     else:
+    #         delta = (delta - mu) / std
+    # else:
+    #     '''constrain delta: range [x-epsilon, x+epsilon]'''
+    #     epsilon = args.mild_l_inf / std
+    #     if delta is None:
+    #         delta = 2 * epsilon * torch.rand_like(X) - epsilon + X
+    #     else:
+    #         delta = clamp(delta, -epsilon, epsilon)
+            
     delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
+    # delta = delta.cuda()
+
     original_img = X.clone()
     if args.random_sparse_pixel:
         '''random select pixels'''
@@ -623,14 +625,14 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
     else:
         '''select by learnable mask'''
         learnable_mask.requires_grad = True
-        
-    delta = delta.cuda()
-    temp_delta = delta[0].data.detach().cpu().numpy()
-    temp_delta = temp_delta.squeeze()
-    temp_delta = normalize_vec(temp_delta)
-    plt.imshow(temp_delta.transpose(1,2,0))
-    plt.savefig('init')
-    plt.close()
+    
+    # temp_delta = delta[0].data.detach().cpu().numpy()
+    # temp_delta = temp_delta.squeeze()
+    # temp_delta = normalize_vec(temp_delta)
+    # plt.imshow(temp_delta.transpose(1,2,0))
+    # plt.savefig('init')
+    # plt.close()  
+    init_delta = delta.clone()
     '''Start Adv Attack'''
     for train_iter_num in range(args.train_attack_iters):
         model.zero_grad()
@@ -709,19 +711,20 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
                 mask_grad = torch.autograd.grad(loss, learnable_mask)[0]
             else:
                 grad = torch.autograd.grad(loss, delta)[0]
-        avg_grad = grad.mean(axis=0, keepdim=True)
-        grad[:, ...] = avg_grad
+        # avg_grad = grad.mean(axis=0, keepdim=True)
+        # grad[:, ...] = avg_grad
         opt.zero_grad()
         delta.grad = -grad
         opt.step()
         scheduler.step()
-        
-        temp_delta = delta[0].data.detach().cpu().numpy()
-        temp_delta = temp_delta.squeeze()
-        temp_delta = normalize_vec(temp_delta)
-        plt.imshow(temp_delta.transpose(1,2,0))
-        plt.savefig('final')
-        plt.close()
+
+        # print(delta.grad)      
+        # temp_delta = delta[0].data.detach().cpu().numpy()
+        # temp_delta = temp_delta.squeeze()
+        # temp_delta = normalize_vec(temp_delta)
+        # plt.imshow(temp_delta.transpose(1,2,0))
+        # plt.savefig('final')
+        # plt.close()
 
         if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
             mask_opt.zero_grad()
@@ -750,6 +753,7 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
             delta.data = clamp(delta, original_img - epsilon, original_img + epsilon)
 
         delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
+    print(init_delta - delta)  
     exit()
     perturb_x = X + torch.mul(delta, mask)
 

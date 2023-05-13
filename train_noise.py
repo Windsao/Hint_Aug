@@ -225,13 +225,13 @@ def get_args_parser():
     parser.add_argument('--num_patch', default=1, type=int)
     parser.add_argument('--sparse_pixel_num', default=0, type=int)
 
-    parser.add_argument('--attack_mode', default='CE_loss', choices=['CE_loss', 'Attention'], type=str)
+    parser.add_argument('--attack_mode', default='Attention', choices=['CE_loss', 'Attention'], type=str)
     parser.add_argument('--atten_loss_weight', default=0.02, type=float)
     parser.add_argument('--atten_select', default=4, type=int, help='Select patch based on which attention layer')
     parser.add_argument('--mild_l_2', default=0., type=float, help='Range: 0-16')
     parser.add_argument('--mild_l_inf', default=1, type=float, help='Range: 0-1')
 
-    parser.add_argument('--train_attack_iters', default=1, type=int)
+    parser.add_argument('--train_attack_iters', default=4, type=int)
     parser.add_argument('--random_sparse_pixel', action='store_true', help='random select sparse pixel or not')
     parser.add_argument('--learnable_mask_stop', default=200, type=int)
 
