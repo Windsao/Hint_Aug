@@ -18,6 +18,13 @@ import torch.nn.functional as F
 from model.supernet_vision_transformer_timm_switch import VisionTransformer, switchableNorm
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def normalize_vec(vec):
+    return (vec - vec.min()) / (vec.max() - vec.min())
+
 def change_bn(model, flag):
     for m in model.modules():
         if isinstance(m, switchableNorm):
@@ -282,7 +289,6 @@ def patch_fool_mask(model, X, y, args):
                 mask_grad = torch.autograd.grad(loss, learnable_mask)[0]
             else:
                 grad = torch.autograd.grad(loss, delta)[0]
-
         opt.zero_grad()
         delta.grad = -grad
         opt.step()
@@ -529,6 +535,225 @@ def patch_fool(model, X, y, args):
     perturb_x = X + torch.mul(delta, mask)
 
     return perturb_x
+
+def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
+    patch_size = 16    
+    filter = torch.ones([1, 3, patch_size, patch_size]).float().cuda()
+    mu = torch.tensor(IMAGENET_DEFAULT_MEAN).view(3, 1, 1).cuda()
+    std = torch.tensor(IMAGENET_DEFAULT_STD).view(3, 1, 1).cuda()
+
+    patch_num_per_line = int(X.size(-1) / patch_size)
+
+    '''choose patch'''
+    # max_patch_index size: [Batch, num_patch attack]
+    if args.patch_select == 'Rand':
+        '''random choose patch'''
+        max_patch_index = np.random.randint(0, 14 * 14, (X.size(0), args.num_patch))
+        max_patch_index = torch.from_numpy(max_patch_index)
+    elif args.patch_select == 'Saliency':
+        '''gradient based method'''
+        grad = torch.autograd.grad(loss, delta)[0]
+        # print(grad.shape)
+        grad = torch.abs(grad)
+        patch_grad = F.conv2d(grad, filter, stride=patch_size)
+        patch_grad = patch_grad.view(patch_grad.size(0), -1)
+        max_patch_index = patch_grad.argsort(descending=True)[:, :args.num_patch]
+    elif args.patch_select == 'Attn':
+        '''attention based method'''
+        atten_layer = atten[args.atten_select].mean(dim=1)
+        atten_layer = atten_layer.mean(dim=-2)[:, 1:]
+        max_patch_index = atten_layer.argsort(descending=True)[:, :args.num_patch]
+    elif args.patch_select == 'Fixed':
+        max_patch_index = torch.zeros((X.size(0), args.num_patch))
+    else:
+        print(f'Unknown patch_select: {args.patch_select}')
+        raise
+    '''build mask'''
+    mask = torch.zeros([X.size(0), 1, X.size(2), X.size(3)]).cuda()
+    if args.sparse_pixel_num != 0:
+        learnable_mask = mask.clone()
+
+    for j in range(X.size(0)):
+        index_list = max_patch_index[j]
+        for index in index_list:
+            if args.patch_select == 'Fixed':
+                index = 0
+            row = (index // patch_num_per_line) * patch_size
+            column = (index % patch_num_per_line) * patch_size
+
+            if args.sparse_pixel_num != 0:
+                learnable_mask.data[j, :, row:row + patch_size, column:column + patch_size] = torch.rand(
+                    [patch_size, patch_size])
+            mask[j, :, row:row + patch_size, column:column + patch_size] = 1
+
+    '''adv attack'''
+    max_patch_index_matrix = max_patch_index[:, 0]
+    max_patch_index_matrix = max_patch_index_matrix.repeat(197, 1)
+    max_patch_index_matrix = max_patch_index_matrix.permute(1, 0)
+    max_patch_index_matrix = max_patch_index_matrix.flatten().long()
+
+    if args.mild_l_inf == 0:
+        if delta is None:
+            '''random init delta'''
+            delta = (torch.rand_like(X) - mu) / std
+        else:
+            delta = (delta - mu) / std
+    else:
+        '''constrain delta: range [x-epsilon, x+epsilon]'''
+        epsilon = args.mild_l_inf / std
+        if delta is None:
+            delta = 2 * epsilon * torch.rand_like(X) - epsilon + X
+        else:
+            delta = 2 * epsilon * delta - epsilon + delta
+
+    delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
+    original_img = X.clone()
+    if args.random_sparse_pixel:
+        '''random select pixels'''
+        sparse_mask = torch.zeros_like(mask)
+        learnable_mask_temp = learnable_mask.view(learnable_mask.size(0), -1)
+        sparse_mask_temp = sparse_mask.view(sparse_mask.size(0), -1)
+        value, _ = learnable_mask_temp.sort(descending=True)
+        threshold = value[:, args.sparse_pixel_num - 1].view(-1, 1)
+        sparse_mask_temp[learnable_mask_temp >= threshold] = 1
+        mask = sparse_mask
+
+    if args.sparse_pixel_num == 0 or args.random_sparse_pixel:
+        X = torch.mul(X, 1 - mask)
+    else:
+        '''select by learnable mask'''
+        learnable_mask.requires_grad = True
+        
+    delta = delta.cuda()
+    temp_delta = delta[0].data.detach().cpu().numpy()
+    temp_delta = temp_delta.squeeze()
+    temp_delta = normalize_vec(temp_delta)
+    plt.imshow(temp_delta.transpose(1,2,0))
+    plt.savefig('init')
+    plt.close()
+    '''Start Adv Attack'''
+    for train_iter_num in range(args.train_attack_iters):
+        model.zero_grad()
+        opt.zero_grad()
+
+        '''Build Sparse Patch attack binary mask'''
+        if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
+            if train_iter_num < args.learnable_mask_stop:
+                mask_opt.zero_grad()
+                sparse_mask = torch.zeros_like(mask)
+                learnable_mask_temp = learnable_mask.view(learnable_mask.size(0), -1)
+                sparse_mask_temp = sparse_mask.view(sparse_mask.size(0), -1)
+                value, _ = learnable_mask_temp.sort(descending=True)
+
+                threshold = value[:, args.sparse_pixel_num-1].view(-1, 1)
+                sparse_mask_temp[learnable_mask_temp >= threshold] = 1
+
+                '''inference as sparse_mask but backward as learnable_mask'''
+                temp_mask = ((sparse_mask - learnable_mask).detach() + learnable_mask) * mask
+            else:
+                temp_mask = sparse_mask
+
+            X = original_img * (1-sparse_mask)        
+            out, atten = model(X + torch.mul(delta, temp_mask))
+ 
+        else:
+            out, atten = model(X + torch.mul(delta, mask))
+
+        criterion = nn.CrossEntropyLoss().cuda()
+        
+        '''final CE-loss'''
+        # target_y = torch.zeros_like(y).cuda()
+        # loss = criterion(out, target_y)
+        loss = criterion(out, y)
+
+        if args.attack_mode == 'Attention':
+            grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]
+            ce_loss_grad_temp = grad.view(X.size(0), -1).detach().clone()
+            if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+                mask_grad = torch.autograd.grad(loss, learnable_mask, retain_graph=True)[0]
+
+            # Attack the first 6 layers' Attn
+            range_list = range(len(atten)//2)
+            for atten_num in range_list:
+                if atten_num == 0:
+                    continue
+                atten_map = atten[atten_num]
+                atten_map = atten_map.mean(dim=1)
+                atten_map = atten_map.view(-1, atten_map.size(-1))
+                atten_map = -torch.log(atten_map)
+
+                atten_loss = F.nll_loss(atten_map, max_patch_index_matrix + 1)
+                atten_grad = torch.autograd.grad(atten_loss, delta, retain_graph=True)[0]
+
+                atten_grad_temp = atten_grad.view(X.size(0), -1)
+                cos_sim = F.cosine_similarity(atten_grad_temp, ce_loss_grad_temp, dim=1)
+
+                if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+                    mask_atten_grad = torch.autograd.grad(atten_loss, learnable_mask, retain_graph=True)[0]
+
+                '''PCGrad'''
+                # atten_grad = PCGrad(atten_grad_temp, ce_loss_grad_temp, cos_sim, grad.shape)
+                if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
+                    mask_atten_grad_temp = mask_atten_grad.view(mask_atten_grad.size(0), -1)
+                    ce_mask_grad_temp = mask_grad.view(mask_grad.size(0), -1)
+                    mask_cos_sim = F.cosine_similarity(mask_atten_grad_temp, ce_mask_grad_temp, dim=1)
+                    mask_atten_grad = PCGrad(mask_atten_grad_temp, ce_mask_grad_temp, mask_cos_sim, mask_atten_grad.shape)
+
+                grad += atten_grad * args.atten_loss_weight
+                if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
+                    mask_grad += mask_atten_grad * args.atten_loss_weight
+        else:
+            '''no attention loss'''
+            if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+                grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]
+                mask_grad = torch.autograd.grad(loss, learnable_mask)[0]
+            else:
+                grad = torch.autograd.grad(loss, delta)[0]
+        avg_grad = grad.mean(axis=0, keepdim=True)
+        grad[:, ...] = avg_grad
+        opt.zero_grad()
+        delta.grad = -grad
+        opt.step()
+        scheduler.step()
+        
+        temp_delta = delta[0].data.detach().cpu().numpy()
+        temp_delta = temp_delta.squeeze()
+        temp_delta = normalize_vec(temp_delta)
+        plt.imshow(temp_delta.transpose(1,2,0))
+        plt.savefig('final')
+        plt.close()
+
+        if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
+            mask_opt.zero_grad()
+            learnable_mask.grad = -mask_grad
+            mask_opt.step()
+
+            learnable_mask_temp = learnable_mask.view(X.size(0), -1)
+            learnable_mask.data -= learnable_mask_temp.min(-1)[0].view(-1, 1, 1, 1)
+            learnable_mask.data += 1e-6
+            learnable_mask.data *= mask
+
+        '''l2 constrain'''
+        if args.mild_l_2 != 0:
+            radius = (args.mild_l_2 / std).squeeze()
+            perturbation = (delta.detach() - original_img) * mask
+            l2 = torch.linalg.norm(perturbation.view(perturbation.size(0), perturbation.size(1), -1), dim=-1)
+            radius = radius.repeat([l2.size(0), 1])
+            l2_constraint = radius / l2
+            l2_constraint[l2 < radius] = 1.
+            l2_constraint = l2_constraint.view(l2_constraint.size(0), l2_constraint.size(1), 1, 1)
+            delta.data = original_img + perturbation * l2_constraint
+
+        '''l_inf constrain'''
+        if args.mild_l_inf != 0:
+            epsilon = args.mild_l_inf / std
+            delta.data = clamp(delta, original_img - epsilon, original_img + epsilon)
+
+        delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
+    exit()
+    perturb_x = X + torch.mul(delta, mask)
+
+    return perturb_x, delta
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
