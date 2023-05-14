@@ -226,7 +226,7 @@ def get_args_parser():
     parser.add_argument('--sparse_pixel_num', default=0, type=int)
 
     parser.add_argument('--attack_mode', default='Attention', choices=['CE_loss', 'Attention'], type=str)
-    parser.add_argument('--atten_loss_weight', default=0.02, type=float)
+    parser.add_argument('--atten_loss_weight', default=1.0, type=float)
     parser.add_argument('--atten_select', default=4, type=int, help='Select patch based on which attention layer')
     parser.add_argument('--mild_l_2', default=0., type=float, help='Range: 0-16')
     parser.add_argument('--mild_l_inf', default=1, type=float, help='Range: 0-1')
@@ -447,7 +447,7 @@ def main(args):
         Lp = 8/255.
         eps = torch.tensor([Lp, Lp, Lp]).view(3, 1, 1).cuda()
         delta = torch.randn((1, 3, args.input_size, args.input_size)).cuda()
-        delta.data = clamp(delta, -eps, eps)
+        # delta.data = clamp(delta, -eps, eps)
         np.save('init_delta.npy', delta.detach().cpu().numpy())
 
     if args.pretrained_noise:
@@ -479,7 +479,7 @@ def main(args):
                     opt=opt,
                     scheduler=scheduler
                 )
-                delta = delta_out[0]
+                delta = delta_out
 
                 save_name = args.data_set + '_' + str(args.few_shot_seed) + '_' + str(args.few_shot_shot)
                 lr_scheduler.step(epoch)

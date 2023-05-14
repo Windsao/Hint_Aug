@@ -11,7 +11,7 @@ final_delta = np.load('delta.npy').squeeze()
 init_delta = normalize_vec(init_delta) 
 final_delta = normalize_vec(final_delta) 
 # pre_delta = normalize_vec(pre_delta) 
-
+print(np.sum(abs(init_delta - final_delta)))
 plt.imshow(init_delta.transpose(1,2,0))
 plt.savefig('init')
 plt.close()

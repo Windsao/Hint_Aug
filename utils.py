@@ -20,7 +20,7 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMA
 
 import numpy as np
 import matplotlib.pyplot as plt
-
+import math
 
 def normalize_vec(vec):
     return (vec - vec.min()) / (vec.max() - vec.min())
@@ -604,8 +604,7 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
     #     if delta is None:
     #         delta = 2 * epsilon * torch.rand_like(X) - epsilon + X
     #     else:
-    #         delta = clamp(delta, -epsilon, epsilon)
-            
+    #         delta = clamp(delta, -epsilon, epsilon)           
     delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
     # delta = delta.cuda()
 
@@ -632,11 +631,15 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
     # plt.imshow(temp_delta.transpose(1,2,0))
     # plt.savefig('init')
     # plt.close()  
-    init_delta = delta.clone()
+    # exit()
+
+    init_delta = delta.clone().detach().cpu().numpy()
     '''Start Adv Attack'''
     for train_iter_num in range(args.train_attack_iters):
         model.zero_grad()
         opt.zero_grad()
+
+        batch_delta = delta.repeat(X.size(0), 1, 1, 1).clone()
 
         '''Build Sparse Patch attack binary mask'''
         if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel):
@@ -656,10 +659,10 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
                 temp_mask = sparse_mask
 
             X = original_img * (1-sparse_mask)        
-            out, atten = model(X + torch.mul(delta, temp_mask))
+            out, atten = model(X + torch.mul(batch_delta, temp_mask))
  
         else:
-            out, atten = model(X + torch.mul(delta, mask))
+            out, atten = model(X + torch.mul(batch_delta, mask))
 
         criterion = nn.CrossEntropyLoss().cuda()
         
@@ -669,7 +672,7 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
         loss = criterion(out, y)
 
         if args.attack_mode == 'Attention':
-            grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]
+            grad = torch.autograd.grad(loss, batch_delta, retain_graph=True)[0]
             ce_loss_grad_temp = grad.view(X.size(0), -1).detach().clone()
             if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
                 mask_grad = torch.autograd.grad(loss, learnable_mask, retain_graph=True)[0]
@@ -685,7 +688,7 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
                 atten_map = -torch.log(atten_map)
 
                 atten_loss = F.nll_loss(atten_map, max_patch_index_matrix + 1)
-                atten_grad = torch.autograd.grad(atten_loss, delta, retain_graph=True)[0]
+                atten_grad = torch.autograd.grad(atten_loss, batch_delta, retain_graph=True)[0]
 
                 atten_grad_temp = atten_grad.view(X.size(0), -1)
                 cos_sim = F.cosine_similarity(atten_grad_temp, ce_loss_grad_temp, dim=1)
@@ -707,18 +710,17 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
         else:
             '''no attention loss'''
             if args.sparse_pixel_num != 0 and (not args.random_sparse_pixel) and train_iter_num < args.learnable_mask_stop:
-                grad = torch.autograd.grad(loss, delta, retain_graph=True)[0]
+                grad = torch.autograd.grad(loss, batch_delta, retain_graph=True)[0]
                 mask_grad = torch.autograd.grad(loss, learnable_mask)[0]
             else:
-                grad = torch.autograd.grad(loss, delta)[0]
-        # avg_grad = grad.mean(axis=0, keepdim=True)
-        # grad[:, ...] = avg_grad
+                grad = torch.autograd.grad(loss, batch_delta)[0]
+        avg_grad = grad.mean(axis=0, keepdim=True)
+
         opt.zero_grad()
-        delta.grad = -grad
+        delta.grad = -avg_grad
         opt.step()
         scheduler.step()
 
-        # print(delta.grad)      
         # temp_delta = delta[0].data.detach().cpu().numpy()
         # temp_delta = temp_delta.squeeze()
         # temp_delta = normalize_vec(temp_delta)
@@ -750,11 +752,10 @@ def patch_fool_fixed(model, X, y, delta, opt, scheduler, args):
         '''l_inf constrain'''
         if args.mild_l_inf != 0:
             epsilon = args.mild_l_inf / std
-            delta.data = clamp(delta, original_img - epsilon, original_img + epsilon)
+            # delta.data = clamp(delta, original_img - epsilon, original_img + epsilon)
 
         delta.data = clamp(delta, (0 - mu) / std, (1 - mu) / std)
-    print(init_delta - delta)  
-    exit()
+
     perturb_x = X + torch.mul(delta, mask)
 
     return perturb_x, delta

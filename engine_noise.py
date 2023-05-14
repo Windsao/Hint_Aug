@@ -228,8 +228,6 @@ def train_one_epoch_delta(model: torch.nn.Module, criterion: torch.nn.Module,
     for samples, targets in data_loader:
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        if delta.size(0) != samples.size(0):
-            delta = delta.repeat(samples.size(0), 1, 1, 1)
         # sample random config
         if mode == 'super':
             # sample
@@ -245,7 +243,6 @@ def train_one_epoch_delta(model: torch.nn.Module, criterion: torch.nn.Module,
             samples, targets = mixup_fn(samples, targets)
 
         adv_images, delta = myutils.patch_fool_fixed(model, samples, targets, delta, opt, scheduler, args)
-        
     print("Finish Training Delta One epoch")
     return delta
 
